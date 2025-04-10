@@ -6,7 +6,7 @@ export function LoadingScreen() {
       <div className="text-center">
         <div className="w-24 h-24 mb-4 mx-auto">
           <img
-            src="https://raw.githubusercontent.com/n3r4zzurr0/svg-spinners/main/preview/90-ring-with-bg-white.svg"
+            src="MOOD VERSE.gif"
             alt="Loading..."
             className="w-full h-full"
           />
