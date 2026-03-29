@@ -14,6 +14,14 @@
       },
       "oauth_client": [
         {
+          "client_id": "688460385973-bbl443hu9takv70uevjfbfv9uqnvb4df.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.moodverse.app",
+            "certificate_hash": "348ae438ac619452366a5543d0aa6c80af29b9bd"
+          }
+        },
+        {
           "client_id": "688460385973-cbrghvjsipi0kre1lt79hpk35rdr3bms.apps.googleusercontent.com",
           "client_type": 1,
           "android_info": {
