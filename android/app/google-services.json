@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "688460385973",
+    "project_id": "moodverse-c27ec",
+    "storage_bucket": "moodverse-c27ec.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:688460385973:android:065652598cc439615238fc",
+        "android_client_info": {
+          "package_name": "com.moodverse.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "688460385973-cbrghvjsipi0kre1lt79hpk35rdr3bms.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.moodverse.app",
+            "certificate_hash": "75ab19f67737f5fa2f8cd526fd7a3d86d389dc2c"
+          }
+        },
+        {
+          "client_id": "688460385973-7t8531m2pq7tu7oclqll2c7r3agffebc.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDwJzMDYkTDRf2uaGEUDlVxhNkKzVFU19c"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "688460385973-7t8531m2pq7tu7oclqll2c7r3agffebc.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,23 @@
+{
+  "name": "Mood Verse",
+  "short_name": "MoodVerse",
+  "description": "AI-powered mood detection and wellbeing support app.",
+  "theme_color": "#7c3aed",
+  "background_color": "#f8fafc",
+  "display": "standalone",
+  "start_url": "./",
+  "scope": "./",
+  "icons": [
+    {
+      "src": "icons/icon-192.webp",
+      "type": "image/webp",
+      "sizes": "192x192"
+    },
+    {
+      "src": "icons/icon-512.webp",
+      "type": "image/webp",
+      "sizes": "512x512",
+      "purpose": "maskable any"
+    }
+  ]
+}

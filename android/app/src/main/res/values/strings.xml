@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Mood Verse</string>
+    <string name="title_activity_main">Mood Verse</string>
+    <string name="package_name">com.moodverse.app</string>
+    <string name="custom_url_scheme">com.moodverse.app</string>
+</resources>

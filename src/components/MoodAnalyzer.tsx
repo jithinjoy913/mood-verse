@@ -1,78 +1,261 @@
-import React, { useRef, useCallback, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import Webcam from 'react-webcam';
 import * as tf from '@tensorflow/tfjs';
-import * as faceDetection from '@tensorflow-models/face-detection';
-import { Camera, RefreshCw, Music, Film, Activity, ArrowRight } from 'lucide-react';
+import * as faceapi from 'face-api.js';
+import { Camera, RefreshCw, Music, Film, Activity, ArrowRight, ScanFace, Shield, Zap, HeartPulse, AlertTriangle, VideoOff, Sparkles, ThumbsDown, ThumbsUp } from 'lucide-react';
+import { getMoodCoachTip } from '../services/aiMoodCoach';
+import { WellbeingHub } from './WellbeingHub';
+import { PanicSupportModal } from './PanicSupportModal';
+
+type AppMood = 'happy' | 'sad' | 'neutral' | 'excited' | 'tired';
+type RecommendationTab = 'music' | 'movies' | 'activities';
+
+const MODEL_SOURCES = [
+  '/models',
+  'https://justadudewhohacks.github.io/face-api.js/models'
+];
+
+const HISTORY_WINDOW = 8;
+const PERSONALIZATION_KEY = 'moodverse_recommendation_scores_v1';
+const DEFAULT_CONFIDENCE_THRESHOLD = 0.62;
+
+const TAB_PRIORITY_BY_MOOD: Record<AppMood, RecommendationTab[]> = {
+  happy: ['activities', 'music', 'movies'],
+  sad: ['music', 'activities', 'movies'],
+  neutral: ['activities', 'music', 'movies'],
+  excited: ['activities', 'music', 'movies'],
+  tired: ['activities', 'music', 'movies']
+};
+
+function readPreferenceScores(): Record<string, number> {
+  try {
+    const raw = window.localStorage.getItem(PERSONALIZATION_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, number>;
+    return parsed ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function writePreferenceScores(scores: Record<string, number>) {
+  try {
+    window.localStorage.setItem(PERSONALIZATION_KEY, JSON.stringify(scores));
+  } catch {
+    // Ignore storage failures gracefully.
+  }
+}
+
+function recommendationKey(tab: RecommendationTab, mood: AppMood, title: string): string {
+  return `${tab}|${mood}|${title}`;
+}
+
+function adjustRecommendationScore(tab: RecommendationTab, mood: AppMood, title: string, delta: number) {
+  const scores = readPreferenceScores();
+  const key = recommendationKey(tab, mood, title);
+  const nextScore = (scores[key] ?? 0) + delta;
+  scores[key] = Math.max(-5, Math.min(25, nextScore));
+  writePreferenceScores(scores);
+}
+
+function getRecommendationScore(tab: RecommendationTab, mood: AppMood, title: string): number {
+  const scores = readPreferenceScores();
+  return scores[recommendationKey(tab, mood, title)] ?? 0;
+}
+
+function trackRecommendationInteraction(tab: RecommendationTab, mood: AppMood, title: string) {
+  adjustRecommendationScore(tab, mood, title, 1);
+}
+
+function trackRecommendationFeedback(tab: RecommendationTab, mood: AppMood, title: string, helpful: boolean) {
+  adjustRecommendationScore(tab, mood, title, helpful ? 2 : -2);
+}
+
+function sortByPreference<T extends { title: string }>(items: T[], tab: RecommendationTab, mood: AppMood): T[] {
+  return [...items]
+    .map((item, index) => ({
+      item,
+      index,
+      score: getRecommendationScore(tab, mood, item.title)
+    }))
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.item);
+}
+
+function getCameraErrorContext(error: unknown): { status: 'denied' | 'blocked'; message: string } {
+  const mediaError = error as DOMException | undefined;
+  const errorName = mediaError?.name ?? '';
+
+  if (errorName === 'NotAllowedError' || errorName === 'PermissionDeniedError' || errorName === 'SecurityError') {
+    return {
+      status: 'denied',
+      message: 'Camera permission is blocked. Please allow camera access in your browser settings and retry.'
+    };
+  }
+
+  return {
+    status: 'blocked',
+    message: 'No accessible camera was found. Connect a camera or check device permissions.'
+  };
+}
+
+function mapExpressionsToMood(expressions: faceapi.FaceExpressions): { mood: AppMood; confidence: number } {
+  const moodScores: Record<AppMood, number> = {
+    happy: expressions.happy,
+    sad: expressions.sad,
+    neutral: expressions.neutral,
+    excited: expressions.surprised * 0.7 + expressions.happy * 0.2 + expressions.angry * 0.1,
+    tired: expressions.neutral * 0.45 + expressions.sad * 0.3 + expressions.fearful * 0.2 + expressions.disgusted * 0.05
+  };
+
+  const entries = Object.entries(moodScores) as Array<[AppMood, number]>;
+  const [mood, confidence] = entries.reduce((best, current) =>
+    current[1] > best[1] ? current : best
+  );
+
+  return { mood, confidence };
+}
+
+function getMostFrequentMood(history: AppMood[]): AppMood | null {
+  if (!history.length) return null;
+
+  const counts = history.reduce<Record<AppMood, number>>((acc, mood) => {
+    acc[mood] += 1;
+    return acc;
+  }, {
+    happy: 0,
+    sad: 0,
+    neutral: 0,
+    excited: 0,
+    tired: 0
+  });
+
+  const sorted = (Object.entries(counts) as Array<[AppMood, number]>).sort((a, b) => b[1] - a[1]);
+  return sorted[0]?.[0] ?? null;
+}
 
 export function MoodAnalyzer() {
   const webcamRef = useRef<Webcam>(null);
-  const [analyzing, setAnalyzing] = useState(false);
-  const [mood, setMood] = useState<string | null>(null);
+  const rafIdRef = useRef<number | null>(null);
+  const moodHistoryRef = useRef<AppMood[]>([]);
+  const lastInferenceRef = useRef(0);
+
+  const [mood, setMood] = useState<AppMood | null>(null);
+  const [liveMood, setLiveMood] = useState<AppMood | null>(null);
+  const [liveConfidence, setLiveConfidence] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [model, setModel] = useState<faceDetection.FaceDetector | null>(null);
+  const [modelLoaded, setModelLoaded] = useState(false);
+  const [modelSource, setModelSource] = useState<string | null>(null);
+  const [faceVisible, setFaceVisible] = useState(false);
   const [showRecommendations, setShowRecommendations] = useState(false);
+  const [continuousMode, setContinuousMode] = useState(false);
+  const [confidenceThreshold, setConfidenceThreshold] = useState(DEFAULT_CONFIDENCE_THRESHOLD);
+  const [cameraState, setCameraState] = useState<'unknown' | 'granted' | 'denied' | 'blocked'>('unknown');
+  const [cameraMessage, setCameraMessage] = useState('');
+  const [webcamKey, setWebcamKey] = useState(0);
+  const [panicSupportOpen, setPanicSupportOpen] = useState(false);
+
+  const lowConfidence = !!liveMood && faceVisible && liveConfidence < confidenceThreshold;
 
   useEffect(() => {
     const loadModel = async () => {
       try {
         await tf.ready();
         await tf.setBackend('webgl');
-        
-        const detector = await faceDetection.createDetector(
-          faceDetection.SupportedModels.MediaPipeFaceDetector,
-          { 
-            runtime: 'tfjs',
-            modelType: 'short'
+
+        for (const source of MODEL_SOURCES) {
+          try {
+            await Promise.all([
+              faceapi.nets.tinyFaceDetector.loadFromUri(source),
+              faceapi.nets.faceExpressionNet.loadFromUri(source)
+            ]);
+            setModelSource(source);
+            setModelLoaded(true);
+            return;
+          } catch (sourceError) {
+            console.warn(`Failed loading face-api models from ${source}`, sourceError);
           }
-        );
-        setModel(detector);
+        }
+
+        throw new Error('Could not load face-api model files from any configured source.');
       } catch (err) {
         console.error('Error loading face detection model:', err);
-        setError('Failed to load face detection model. Please refresh the page.');
+        setError('Failed to load expression model. Ensure model files are available in /public/models or try again.');
       }
     };
 
     loadModel();
 
     return () => {
-      if (model) {
-        tf.dispose();
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
       }
+      tf.dispose();
     };
   }, []);
 
-  const capture = useCallback(async () => {
-    if (!webcamRef.current || !model) return;
-
-    setAnalyzing(true);
-    setError(null);
-    try {
-      const imageSrc = webcamRef.current.getScreenshot();
-      if (!imageSrc) {
-        throw new Error('Failed to capture image from webcam');
-      }
-
-      const img = new Image();
-      img.src = imageSrc;
-      await img.decode();
-      
-      const faces = await model.detectFaces(img);
-      
-      if (faces.length > 0) {
-        const moods = ['happy', 'sad', 'neutral', 'excited', 'tired'];
-        const detectedMood = moods[Math.floor(Math.random() * moods.length)];
-        setMood(detectedMood);
-        setShowRecommendations(true);
-      } else {
-        setError('No face detected. Please ensure your face is visible in the camera.');
-      }
-    } catch (error) {
-      console.error('Error analyzing mood:', error);
-      setError('Failed to analyze mood. Please try again.');
-    } finally {
-      setAnalyzing(false);
+  useEffect(() => {
+    if (!modelLoaded || cameraState !== 'granted') {
+      return;
     }
-  }, [model]);
+
+    let stopped = false;
+
+    const infer = async () => {
+      if (stopped) return;
+
+      const video = webcamRef.current?.video as HTMLVideoElement | undefined;
+      const now = performance.now();
+
+      if (video && video.readyState === 4 && now - lastInferenceRef.current > 700) {
+        lastInferenceRef.current = now;
+        try {
+          const result = await faceapi
+            .detectSingleFace(
+              video,
+              new faceapi.TinyFaceDetectorOptions({
+                inputSize: 224,
+                scoreThreshold: 0.5
+              })
+            )
+            .withFaceExpressions();
+
+          if (result?.expressions) {
+            setFaceVisible(true);
+            const { mood: predictedMood, confidence } = mapExpressionsToMood(result.expressions);
+
+            moodHistoryRef.current = [...moodHistoryRef.current, predictedMood].slice(-HISTORY_WINDOW);
+            const stableMood = getMostFrequentMood(moodHistoryRef.current);
+
+            if (stableMood) {
+              setLiveMood(stableMood);
+              setLiveConfidence(confidence);
+            }
+          } else {
+            setFaceVisible(false);
+          }
+        } catch (inferenceError) {
+          console.error('Realtime mood inference failed:', inferenceError);
+          setError('Realtime mood detection stopped unexpectedly. Please refresh and try again.');
+          return;
+        }
+      }
+
+      rafIdRef.current = requestAnimationFrame(infer);
+    };
+
+    rafIdRef.current = requestAnimationFrame(infer);
+
+    return () => {
+      stopped = true;
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+      }
+    };
+  }, [modelLoaded, cameraState]);
 
   if (error) {
     return (
@@ -94,97 +277,423 @@ export function MoodAnalyzer() {
   }
 
   if (showRecommendations && mood) {
-    return <RecommendationsPage mood={mood} onReset={() => {
-      setShowRecommendations(false);
-      setMood(null);
-    }} />;
+    return (
+      <>
+        <RecommendationsPage
+          mood={mood}
+          liveMood={liveMood}
+          liveConfidence={liveConfidence}
+          continuousMode={continuousMode}
+          confidenceThreshold={confidenceThreshold}
+          onToggleContinuousMode={() => setContinuousMode((prev) => !prev)}
+          onThresholdChange={(value) => setConfidenceThreshold(value)}
+          onReset={() => {
+            setShowRecommendations(false);
+            setMood(null);
+            moodHistoryRef.current = [];
+          }}
+        />
+        <button
+          onClick={() => setPanicSupportOpen(true)}
+          className="fixed bottom-4 right-4 z-40 rounded-full bg-rose-600 text-white px-4 py-3 shadow-lg hover:bg-rose-700 focus:outline-none focus:ring-2 focus:ring-rose-300"
+          aria-label="Open emergency anxiety support"
+        >
+          SOS Support
+        </button>
+        <PanicSupportModal open={panicSupportOpen} onClose={() => setPanicSupportOpen(false)} />
+      </>
+    );
   }
 
   return (
-    <div className="max-w-2xl mx-auto p-6">
+    <div className="max-w-3xl mx-auto p-4 sm:p-6">
+      <div className="mb-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-3 text-sm text-gray-600">
+          <div className="flex items-center gap-2 text-purple-700 font-semibold mb-1"><Zap className="h-4 w-4" /> Live Scan</div>
+          Mood updates every second while your face is visible.
+        </div>
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-3 text-sm text-gray-600">
+          <div className="flex items-center gap-2 text-purple-700 font-semibold mb-1"><Shield className="h-4 w-4" /> Privacy First</div>
+          Processing runs in-browser without uploading camera frames.
+        </div>
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-3 text-sm text-gray-600">
+          <div className="flex items-center gap-2 text-purple-700 font-semibold mb-1"><HeartPulse className="h-4 w-4" /> Smart Suggestions</div>
+          Recommendations adapt to your detected emotional state.
+        </div>
+      </div>
+
+      <div className="mb-4 bg-white rounded-xl shadow p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div>
+          <p className="text-sm text-gray-500">Live Mood</p>
+          <p className="text-2xl font-bold text-purple-600 capitalize">{liveMood ?? 'Detecting...'}</p>
+          <p className="text-xs text-gray-500 mt-1">
+            {faceVisible
+              ? `Confidence: ${(liveConfidence * 100).toFixed(0)}%`
+              : 'No face detected. Align your face in the frame.'}
+          </p>
+          {lowConfidence && (
+            <p className="text-xs text-amber-700 mt-2">
+              Confidence is low. Improve framing and lighting before using this mood.
+            </p>
+          )}
+        </div>
+        <div className="text-xs text-gray-500">
+          Model source: {modelSource ?? 'loading...'}
+        </div>
+      </div>
+
       <div className="relative">
+        {(cameraState === 'denied' || cameraState === 'blocked') && (
+          <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5" />
+              <div>
+                <p className="font-semibold text-amber-800">Camera access needed</p>
+                <p className="text-sm text-amber-700 mt-1">{cameraMessage}</p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    onClick={() => {
+                      setCameraState('unknown');
+                      setCameraMessage('');
+                      setWebcamKey((prev) => prev + 1);
+                    }}
+                    className="inline-flex items-center px-3 py-2 rounded-lg bg-amber-600 text-white text-sm hover:bg-amber-700"
+                  >
+                    <RefreshCw className="h-4 w-4 mr-2" />
+                    Retry Camera Access
+                  </button>
+                  <a
+                    href="https://support.google.com/chrome/answer/2693767"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center px-3 py-2 rounded-lg border border-amber-300 text-amber-700 text-sm hover:bg-amber-100"
+                  >
+                    Permission Help
+                  </a>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {cameraState === 'granted' && lowConfidence && (
+          <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+            <p className="font-semibold text-amber-800">Get a better read</p>
+            <ul className="mt-2 text-sm text-amber-700 list-disc list-inside space-y-1">
+              <li>Face the camera directly and keep your full face inside the frame.</li>
+              <li>Use soft front lighting and avoid strong backlight.</li>
+              <li>Hold still for 2 to 3 seconds before tapping Use Live Mood.</li>
+            </ul>
+          </div>
+        )}
+
         <Webcam
+          key={webcamKey}
           ref={webcamRef}
           screenshotFormat="image/jpeg"
-          className="w-full rounded-lg shadow-lg"
+          className="w-full rounded-xl shadow-xl border border-white/70"
           mirrored={true}
+          audio={false}
+          onUserMedia={() => {
+            setCameraState('granted');
+            setCameraMessage('');
+          }}
+          onUserMediaError={(webcamError) => {
+            const context = getCameraErrorContext(webcamError);
+            setCameraState(context.status);
+            setCameraMessage(context.message);
+            setFaceVisible(false);
+          }}
           videoConstraints={{
             width: 640,
             height: 480,
             facingMode: "user"
           }}
         />
-        <div className="absolute bottom-4 left-1/2 transform -translate-x-1/2 space-x-4">
+        <div className="absolute bottom-3 left-1/2 transform -translate-x-1/2 flex items-center gap-2 sm:gap-4">
           <button
-            onClick={capture}
-            disabled={analyzing || !model}
-            className="bg-purple-600 text-white px-6 py-3 rounded-full shadow-lg hover:bg-purple-700 transition-colors flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={() => {
+              if (!liveMood) return;
+              setMood(liveMood);
+              setShowRecommendations(true);
+            }}
+            disabled={!modelLoaded || !liveMood || !faceVisible || cameraState !== 'granted' || lowConfidence}
+            className="bg-purple-600 text-white px-4 sm:px-6 py-3 rounded-full shadow-lg hover:bg-purple-700 transition-colors flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {analyzing ? (
-              <>
-                <RefreshCw className="h-5 w-5 animate-spin" />
-                <span>Analyzing...</span>
-              </>
-            ) : !model ? (
+            {!modelLoaded ? (
               <>
                 <RefreshCw className="h-5 w-5 animate-spin" />
                 <span>Loading model...</span>
               </>
             ) : (
               <>
-                <Camera className="h-5 w-5" />
-                <span>Capture Mood</span>
+                <ScanFace className="h-5 w-5" />
+                <span className="hidden sm:inline">Use Live Mood</span>
+                <span className="sm:hidden">Use Mood</span>
               </>
             )}
           </button>
+          <button
+            onClick={() => {
+              moodHistoryRef.current = [];
+              setLiveMood(null);
+              setLiveConfidence(0);
+            }}
+            className="bg-white text-gray-700 px-3 sm:px-4 py-3 rounded-full shadow-lg hover:bg-gray-100 transition-colors inline-flex items-center space-x-2"
+          >
+            <Camera className="h-5 w-5" />
+            <span className="hidden sm:inline">Reset</span>
+          </button>
         </div>
+
+        {cameraState !== 'granted' && (
+          <div className="absolute top-3 left-3 rounded-lg bg-black/65 text-white px-3 py-2 text-xs flex items-center gap-2">
+            <VideoOff className="h-4 w-4" />
+            Waiting for camera permission
+          </div>
+        )}
       </div>
+
+      <button
+        onClick={() => setPanicSupportOpen(true)}
+        className="fixed bottom-4 right-4 z-40 rounded-full bg-rose-600 text-white px-4 py-3 shadow-lg hover:bg-rose-700 focus:outline-none focus:ring-2 focus:ring-rose-300"
+        aria-label="Open emergency anxiety support"
+      >
+        SOS Support
+      </button>
+      <PanicSupportModal open={panicSupportOpen} onClose={() => setPanicSupportOpen(false)} />
     </div>
   );
 }
 
 interface RecommendationsPageProps {
-  mood: string;
+  mood: AppMood;
+  liveMood: AppMood | null;
+  liveConfidence: number;
+  continuousMode: boolean;
+  confidenceThreshold: number;
+  onToggleContinuousMode: () => void;
+  onThresholdChange: (value: number) => void;
   onReset: () => void;
 }
 
-function RecommendationsPage({ mood, onReset }: RecommendationsPageProps) {
-  const [activeTab, setActiveTab] = useState<'music' | 'movies' | 'activities'>('music');
+function RecommendationsPage({ mood, liveMood, liveConfidence, continuousMode, confidenceThreshold, onToggleContinuousMode, onThresholdChange, onReset }: RecommendationsPageProps) {
+  const [activeTab, setActiveTab] = useState<RecommendationTab>('music');
+  const [currentMood, setCurrentMood] = useState<AppMood>(mood);
+  const [justUpdated, setJustUpdated] = useState(false);
+  const [isPanelRefreshing, setIsPanelRefreshing] = useState(false);
+  const [feedbackMessage, setFeedbackMessage] = useState('');
+  const [aiTip, setAiTip] = useState('');
+  const [aiTipSource, setAiTipSource] = useState<'local' | 'huggingface' | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+
+  const moodInsights: Record<AppMood, { focus: string; action: string }> = {
+    happy: {
+      focus: 'You are in a high-energy positive state.',
+      action: 'Best next step: choose social or creative activities to sustain momentum.'
+    },
+    sad: {
+      focus: 'Your emotional state looks low and reflective.',
+      action: 'Best next step: start with calming music, then try one gentle self-care activity.'
+    },
+    neutral: {
+      focus: 'You appear steady and balanced right now.',
+      action: 'Best next step: pick productivity or skill-building recommendations first.'
+    },
+    excited: {
+      focus: 'You are showing elevated activation and enthusiasm.',
+      action: 'Best next step: channel energy into movement, focused goals, or group engagement.'
+    },
+    tired: {
+      focus: 'Your expression suggests low energy or fatigue.',
+      action: 'Best next step: prioritize restorative activities before high-intensity options.'
+    }
+  };
+
+  const tabDescriptions: Record<RecommendationTab, { label: string; hint: string; count: number }> = {
+    music: {
+      label: 'Music',
+      hint: 'Play mood-matched tracks instantly',
+      count: 2
+    },
+    movies: {
+      label: 'Movies',
+      hint: 'Watch titles that fit your state',
+      count: 2
+    },
+    activities: {
+      label: 'Activities',
+      hint: 'Actionable tasks for right now',
+      count: 2
+    }
+  };
+
+  useEffect(() => {
+    setCurrentMood(mood);
+  }, [mood]);
+
+  useEffect(() => {
+    const [firstTab] = TAB_PRIORITY_BY_MOOD[currentMood];
+    setActiveTab(firstTab);
+  }, [currentMood]);
+
+  useEffect(() => {
+    if (!continuousMode || !liveMood || liveMood === currentMood || liveConfidence < confidenceThreshold) {
+      return;
+    }
+
+    setCurrentMood(liveMood);
+    setJustUpdated(true);
+    const timer = window.setTimeout(() => setJustUpdated(false), 1200);
+    return () => window.clearTimeout(timer);
+  }, [continuousMode, liveMood, liveConfidence, confidenceThreshold, currentMood]);
+
+  const fetchAiTip = async () => {
+    setAiLoading(true);
+    const result = await getMoodCoachTip(currentMood);
+    setAiTip(result.text);
+    setAiTipSource(result.source);
+    setAiLoading(false);
+  };
+
+  const handleInteraction = (tab: RecommendationTab, title: string) => {
+    trackRecommendationInteraction(tab, currentMood, title);
+  };
+
+  const handleFeedback = (tab: RecommendationTab, title: string, helpful: boolean) => {
+    trackRecommendationFeedback(tab, currentMood, title, helpful);
+    setFeedbackMessage(helpful ? 'Thanks. We will prioritize similar suggestions.' : 'Understood. We will show fewer similar suggestions.');
+    window.setTimeout(() => setFeedbackMessage(''), 1500);
+  };
+
+  useEffect(() => {
+    setIsPanelRefreshing(true);
+    const timer = window.setTimeout(() => setIsPanelRefreshing(false), 350);
+    return () => window.clearTimeout(timer);
+  }, [activeTab, currentMood]);
 
   return (
-    <div className="max-w-4xl mx-auto p-6">
-      <div className="bg-white rounded-lg shadow-lg p-8">
-        <div className="text-center mb-8">
-          <h2 className="text-3xl font-bold text-gray-800">Your Mood: <span className="text-purple-600 capitalize">{mood}</span></h2>
+    <div className="max-w-5xl mx-auto p-4 sm:p-6">
+      <div className="bg-white rounded-2xl shadow-lg p-5 sm:p-8 border border-gray-100">
+        <div className="text-center mb-6">
+          <h2 className="text-3xl font-bold text-gray-800">Your Mood: <span className="text-purple-600 capitalize">{currentMood}</span></h2>
           <p className="text-gray-600 mt-2">Here are some personalized recommendations for you</p>
+          {justUpdated && (
+            <p className="text-sm text-emerald-600 mt-2 inline-flex items-center gap-1">
+              <Sparkles className="h-4 w-4" />
+              Updated based on your live expression
+            </p>
+          )}
         </div>
 
-        <div className="flex justify-center space-x-4 mb-8">
+        <div className="mb-6 rounded-xl border border-gray-200 bg-gray-50 p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-gray-800">Continuous recommendations mode</p>
+            <p className="text-xs text-gray-600 mt-1">
+              {continuousMode
+                ? `Auto-refreshing suggestions as your mood changes (${(liveConfidence * 100).toFixed(0)}% confidence).`
+                : 'Suggestions stay fixed until you manually scan again.'}
+            </p>
+            <div className="mt-3">
+              <p className="text-xs text-gray-600 mb-1">Confidence threshold: {(confidenceThreshold * 100).toFixed(0)}%</p>
+              <input
+                type="range"
+                min={0.45}
+                max={0.9}
+                step={0.01}
+                value={confidenceThreshold}
+                onChange={(e) => onThresholdChange(Number(e.target.value))}
+                className="w-52 accent-purple-600"
+              />
+            </div>
+          </div>
+          <button
+            onClick={onToggleContinuousMode}
+            className={`inline-flex items-center rounded-full px-4 py-2 text-sm font-medium transition-colors ${
+              continuousMode
+                ? 'bg-emerald-100 text-emerald-700 border border-emerald-300'
+                : 'bg-white text-gray-700 border border-gray-300'
+            }`}
+          >
+            {continuousMode ? 'Auto Mode: ON' : 'Auto Mode: OFF'}
+          </button>
+        </div>
+
+        <div className="mb-6 rounded-xl border border-indigo-100 bg-indigo-50/70 p-4">
+          <p className="text-sm font-semibold text-indigo-900">Mood insight</p>
+          <p className="text-sm text-indigo-800 mt-1">{moodInsights[currentMood].focus}</p>
+          <p className="text-xs text-indigo-700 mt-2">{moodInsights[currentMood].action}</p>
+        </div>
+
+        <div className="mb-6 rounded-xl border border-emerald-100 bg-emerald-50/70 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-emerald-900">AI mood coach</p>
+              <p className="text-xs text-emerald-700 mt-1">Uses free Hugging Face inference when token is set, otherwise local smart fallback.</p>
+            </div>
+            <button
+              onClick={fetchAiTip}
+              disabled={aiLoading}
+              className="inline-flex items-center px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm hover:bg-emerald-700 disabled:opacity-60"
+            >
+              {aiLoading ? 'Thinking...' : 'Generate Tip'}
+            </button>
+          </div>
+          {aiTip && (
+            <div className="mt-3 text-sm text-emerald-900">
+              <p>{aiTip}</p>
+              <p className="text-xs text-emerald-700 mt-2">Source: {aiTipSource === 'huggingface' ? 'Hugging Face free-tier API' : 'Local fallback tips'}</p>
+            </div>
+          )}
+        </div>
+
+        <div className="flex justify-center flex-wrap gap-3 mb-6">
           <TabButton
             active={activeTab === 'music'}
             onClick={() => setActiveTab('music')}
             icon={<Music className="h-5 w-5" />}
-            label="Music"
+            label={tabDescriptions.music.label}
+            hint={tabDescriptions.music.hint}
+            count={tabDescriptions.music.count}
           />
           <TabButton
             active={activeTab === 'movies'}
             onClick={() => setActiveTab('movies')}
             icon={<Film className="h-5 w-5" />}
-            label="Movies"
+            label={tabDescriptions.movies.label}
+            hint={tabDescriptions.movies.hint}
+            count={tabDescriptions.movies.count}
           />
           <TabButton
             active={activeTab === 'activities'}
             onClick={() => setActiveTab('activities')}
             icon={<Activity className="h-5 w-5" />}
-            label="Activities"
+            label={tabDescriptions.activities.label}
+            hint={tabDescriptions.activities.hint}
+            count={tabDescriptions.activities.count}
           />
         </div>
 
-        <div className="mt-8">
-          {activeTab === 'music' && <MusicRecommendations mood={mood} />}
-          {activeTab === 'movies' && <MovieRecommendations mood={mood} />}
-          {activeTab === 'activities' && <ActivityRecommendations mood={mood} />}
+        <div className="mb-8 text-center">
+          <p className="inline-flex items-center rounded-full bg-purple-50 text-purple-700 border border-purple-200 px-3 py-1 text-xs font-medium">
+            Showing {tabDescriptions[activeTab].label.toLowerCase()} picks for your <span className="capitalize mx-1">{currentMood}</span> mood
+          </p>
+          {feedbackMessage && <p className="text-xs text-emerald-700 mt-2">{feedbackMessage}</p>}
         </div>
+
+        <div className={`mt-8 transition-opacity duration-300 ${isPanelRefreshing ? 'opacity-80' : 'opacity-100'}`}>
+          {isPanelRefreshing ? (
+            <RecommendationSkeleton />
+          ) : (
+            <>
+              {activeTab === 'music' && <MusicRecommendations mood={currentMood} onInteract={handleInteraction} onFeedback={handleFeedback} />}
+              {activeTab === 'movies' && <MovieRecommendations mood={currentMood} onInteract={handleInteraction} onFeedback={handleFeedback} />}
+              {activeTab === 'activities' && <ActivityRecommendations mood={currentMood} onInteract={handleInteraction} onFeedback={handleFeedback} />}
+            </>
+          )}
+        </div>
+
+        <WellbeingHub mood={currentMood} />
 
         <div className="mt-8 text-center">
           <button
@@ -204,25 +713,85 @@ interface TabButtonProps {
   onClick: () => void;
   icon: React.ReactNode;
   label: string;
+  hint: string;
+  count: number;
 }
 
-function TabButton({ active, onClick, icon, label }: TabButtonProps) {
+function TabButton({ active, onClick, icon, label, hint, count }: TabButtonProps) {
   return (
     <button
       onClick={onClick}
-      className={`flex items-center space-x-2 px-6 py-3 rounded-lg transition-colors ${
+      className={`rounded-xl transition-all border px-4 py-3 min-w-[180px] text-left ${
         active
-          ? 'bg-purple-600 text-white'
-          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+          ? 'bg-purple-600 text-white border-purple-600 shadow-md scale-[1.01]'
+          : 'bg-gray-50 text-gray-700 border-gray-200 hover:bg-gray-100'
       }`}
     >
-      {icon}
-      <span>{label}</span>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 font-semibold">
+          {icon}
+          <span>{label}</span>
+        </div>
+        <span className={`text-[10px] px-2 py-1 rounded-full border ${
+          active ? 'border-white/50 bg-white/15 text-white' : 'border-gray-300 bg-white text-gray-600'
+        }`}>
+          {count} picks
+        </span>
+      </div>
+      <p className={`mt-1 text-xs ${active ? 'text-purple-100' : 'text-gray-500'}`}>{hint}</p>
     </button>
   );
 }
 
-function MusicRecommendations({ mood }: { mood: string }) {
+function RecommendationSkeleton() {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+      {[0, 1].map((item) => (
+        <div key={item} className="p-6 rounded-xl border border-gray-100 bg-gray-50 animate-pulse">
+          <div className="h-5 w-28 rounded bg-gray-200 mb-4" />
+          <div className="h-4 w-4/5 rounded bg-gray-200 mb-2" />
+          <div className="h-4 w-3/5 rounded bg-gray-200 mb-5" />
+          <div className="h-8 w-36 rounded bg-gray-200 mb-3" />
+          <div className="h-8 w-44 rounded bg-gray-200" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+interface RecommendationFeedbackProps {
+  onHelpful: () => void;
+  onNotHelpful: () => void;
+}
+
+function RecommendationFeedback({ onHelpful, onNotHelpful }: RecommendationFeedbackProps) {
+  return (
+    <div className="flex gap-2 mt-3" onClick={(event) => event.stopPropagation()}>
+      <button
+        onClick={(event) => {
+          event.preventDefault();
+          onHelpful();
+        }}
+        className="inline-flex items-center text-xs rounded-full border border-emerald-300 bg-emerald-50 text-emerald-700 px-3 py-1 hover:bg-emerald-100"
+      >
+        <ThumbsUp className="h-3.5 w-3.5 mr-1" />
+        Helpful
+      </button>
+      <button
+        onClick={(event) => {
+          event.preventDefault();
+          onNotHelpful();
+        }}
+        className="inline-flex items-center text-xs rounded-full border border-rose-300 bg-rose-50 text-rose-700 px-3 py-1 hover:bg-rose-100"
+      >
+        <ThumbsDown className="h-3.5 w-3.5 mr-1" />
+        Not helping
+      </button>
+    </div>
+  );
+}
+
+function MusicRecommendations({ mood, onInteract, onFeedback }: { mood: AppMood; onInteract: (tab: RecommendationTab, title: string) => void; onFeedback: (tab: RecommendationTab, title: string, helpful: boolean) => void }) {
   const recommendations = {
     happy: [
       {
@@ -296,31 +865,41 @@ function MusicRecommendations({ mood }: { mood: string }) {
     ]
   };
 
-  const moodRecs = recommendations[mood as keyof typeof recommendations] || [];
+  const moodRecs = sortByPreference(recommendations[mood as keyof typeof recommendations] || [], 'music', mood);
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
       {moodRecs.map((rec, index) => (
         <a
           key={index}
           href={rec.link}
           target="_blank"
           rel="noopener noreferrer"
-          className="block p-6 bg-gray-50 rounded-lg hover:bg-gray-100 transition-colors"
+          onClick={() => onInteract('music', rec.title)}
+          className="block p-6 bg-gray-50 rounded-xl border border-gray-100 hover:bg-gray-100 transition-colors"
         >
+          {index === 0 && (
+            <span className="inline-block text-[10px] font-semibold uppercase tracking-wide bg-emerald-100 text-emerald-700 border border-emerald-200 px-2 py-1 rounded-full mb-3">
+              Top Match
+            </span>
+          )}
           <h3 className="text-xl font-semibold text-gray-800 mb-2">{rec.title}</h3>
           <p className="text-gray-600 mb-4">{rec.description}</p>
           <div className="flex items-center text-purple-600">
             <span className="font-medium">Listen on {rec.platform}</span>
             <ArrowRight className="h-4 w-4 ml-2" />
           </div>
+          <RecommendationFeedback
+            onHelpful={() => onFeedback('music', rec.title, true)}
+            onNotHelpful={() => onFeedback('music', rec.title, false)}
+          />
         </a>
       ))}
     </div>
   );
 }
 
-function MovieRecommendations({ mood }: { mood: string }) {
+function MovieRecommendations({ mood, onInteract, onFeedback }: { mood: AppMood; onInteract: (tab: RecommendationTab, title: string) => void; onFeedback: (tab: RecommendationTab, title: string, helpful: boolean) => void }) {
   const recommendations = {
     happy: [
       {
@@ -394,18 +973,24 @@ function MovieRecommendations({ mood }: { mood: string }) {
     ]
   };
 
-  const moodRecs = recommendations[mood as keyof typeof recommendations] || [];
+  const moodRecs = sortByPreference(recommendations[mood as keyof typeof recommendations] || [], 'movies', mood);
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
       {moodRecs.map((movie, index) => (
         <a
           key={index}
           href={movie.link}
           target="_blank"
           rel="noopener noreferrer"
-          className="block p-6 bg-gray-50 rounded-lg hover:bg-gray-100 transition-colors"
+          onClick={() => onInteract('movies', movie.title)}
+          className="block p-6 bg-gray-50 rounded-xl border border-gray-100 hover:bg-gray-100 transition-colors"
         >
+          {index === 0 && (
+            <span className="inline-block text-[10px] font-semibold uppercase tracking-wide bg-emerald-100 text-emerald-700 border border-emerald-200 px-2 py-1 rounded-full mb-3">
+              Top Match
+            </span>
+          )}
           <h3 className="text-xl font-semibold text-gray-800 mb-2">{movie.title}</h3>
           <p className="text-purple-600 text-sm mb-2">{movie.genre}</p>
           <p className="text-gray-600 mb-4">{movie.description}</p>
@@ -413,13 +998,17 @@ function MovieRecommendations({ mood }: { mood: string }) {
             <span className="font-medium">Watch Now</span>
             <ArrowRight className="h-4 w-4 ml-2" />
           </div>
+          <RecommendationFeedback
+            onHelpful={() => onFeedback('movies', movie.title, true)}
+            onNotHelpful={() => onFeedback('movies', movie.title, false)}
+          />
         </a>
       ))}
     </div>
   );
 }
 
-function ActivityRecommendations({ mood }: { mood: string }) {
+function ActivityRecommendations({ mood, onInteract, onFeedback }: { mood: AppMood; onInteract: (tab: RecommendationTab, title: string) => void; onFeedback: (tab: RecommendationTab, title: string, helpful: boolean) => void }) {
   const [showQuiz, setShowQuiz] = useState(false);
   
   const recommendations = {
@@ -535,7 +1124,7 @@ function ActivityRecommendations({ mood }: { mood: string }) {
     ]
   };
 
-  const moodRecs = recommendations[mood as keyof typeof recommendations] || [];
+  const moodRecs = sortByPreference(recommendations[mood as keyof typeof recommendations] || [], 'activities', mood);
 
   if (showQuiz) {
     return <MoodQuiz mood={mood} onBack={() => setShowQuiz(false)} />;
@@ -549,6 +1138,11 @@ function ActivityRecommendations({ mood }: { mood: string }) {
             key={index}
             className="bg-gray-50 rounded-lg p-6"
           >
+            {index === 0 && (
+              <span className="inline-block text-[10px] font-semibold uppercase tracking-wide bg-emerald-100 text-emerald-700 border border-emerald-200 px-2 py-1 rounded-full mb-3">
+                Top Match
+              </span>
+            )}
             <h3 className="text-xl font-semibold text-gray-800 mb-2">{activity.title}</h3>
             <p className="text-gray-600 mb-4">{activity.description}</p>
             <ul className="space-y-2">
@@ -559,6 +1153,13 @@ function ActivityRecommendations({ mood }: { mood: string }) {
                 </li>
               ))}
             </ul>
+            <RecommendationFeedback
+              onHelpful={() => {
+                onInteract('activities', activity.title);
+                onFeedback('activities', activity.title, true);
+              }}
+              onNotHelpful={() => onFeedback('activities', activity.title, false)}
+            />
           </div>
         ))}
       </div>
@@ -577,7 +1178,7 @@ function ActivityRecommendations({ mood }: { mood: string }) {
 }
 
 interface MoodQuizProps {
-  mood: string;
+  mood: AppMood;
   onBack: () => void;
 }
 

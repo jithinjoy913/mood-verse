@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Mood Verse icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="110" fill="url(#bg)"/>
+  <circle cx="192" cy="206" r="28" fill="#fff"/>
+  <circle cx="320" cy="206" r="28" fill="#fff"/>
+  <path d="M150 316c30 38 76 58 106 58s76-20 106-58" fill="none" stroke="#fff" stroke-width="28" stroke-linecap="round"/>
+</svg>
