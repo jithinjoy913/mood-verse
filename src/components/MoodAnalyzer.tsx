@@ -4,6 +4,8 @@ import * as tf from '@tensorflow/tfjs';
 import * as faceapi from 'face-api.js';
 import { Camera, RefreshCw, Music, Film, Activity, ArrowRight, ScanFace, Shield, Zap, HeartPulse, AlertTriangle, VideoOff, Sparkles, ThumbsDown, ThumbsUp } from 'lucide-react';
 import { getMoodCoachTip } from '../services/aiMoodCoach';
+import { getMusicRecommendations, getMovieRecommendations, type MusicRecommendation, type MovieRecommendation } from '../services/contentRecommendations';
+import { trackEvent } from '../services/analytics';
 import { WellbeingHub } from './WellbeingHub';
 import { PanicSupportModal } from './PanicSupportModal';
 
@@ -17,7 +19,59 @@ const MODEL_SOURCES = [
 
 const HISTORY_WINDOW = 8;
 const PERSONALIZATION_KEY = 'moodverse_recommendation_scores_v1';
-const DEFAULT_CONFIDENCE_THRESHOLD = 0.62;
+const DEFAULT_CONFIDENCE_THRESHOLD = 0.45;
+const INFERENCE_INTERVAL_MS = 500;
+const LOST_FACE_FRAME_TOLERANCE = 4;
+const CALIBRATION_STABLE_FRAMES = 5;
+const DETECTOR_OPTIONS = [
+  new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.3 }),
+  new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.25 }),
+  new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.2 })
+];
+
+function estimateFrameBrightness(video: HTMLVideoElement): number {
+  const canvas = document.createElement('canvas');
+  const sampleWidth = 32;
+  const sampleHeight = 24;
+  canvas.width = sampleWidth;
+  canvas.height = sampleHeight;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return 0.5;
+  ctx.drawImage(video, 0, 0, sampleWidth, sampleHeight);
+  const data = ctx.getImageData(0, 0, sampleWidth, sampleHeight).data;
+  let total = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+    total += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+  return total / (sampleWidth * sampleHeight * 255);
+}
+
+function getQualityIssues(video: HTMLVideoElement, detection: faceapi.FaceDetection): string[] {
+  const issues: string[] = [];
+  const brightness = estimateFrameBrightness(video);
+  if (brightness < 0.18) {
+    issues.push('Increase front lighting for better face detection.');
+  }
+
+  const { width: boxWidth, height: boxHeight, x, y } = detection.box;
+  const faceAreaRatio = (boxWidth * boxHeight) / (video.videoWidth * video.videoHeight);
+  if (faceAreaRatio < 0.08) {
+    issues.push('Move a little closer to the camera.');
+  }
+
+  const centerX = x + boxWidth / 2;
+  const centerY = y + boxHeight / 2;
+  const normalizedOffsetX = Math.abs(centerX - video.videoWidth / 2) / (video.videoWidth / 2);
+  const normalizedOffsetY = Math.abs(centerY - video.videoHeight / 2) / (video.videoHeight / 2);
+  if (normalizedOffsetX > 0.35 || normalizedOffsetY > 0.35) {
+    issues.push('Center your face in the frame.');
+  }
+
+  return issues;
+}
 
 const TAB_PRIORITY_BY_MOOD: Record<AppMood, RecommendationTab[]> = {
   happy: ['activities', 'music', 'movies'],
@@ -142,6 +196,9 @@ export function MoodAnalyzer() {
   const rafIdRef = useRef<number | null>(null);
   const moodHistoryRef = useRef<AppMood[]>([]);
   const lastInferenceRef = useRef(0);
+  const missedFaceFramesRef = useRef(0);
+  const calibrationStableFramesRef = useRef(0);
+  const calibrationReadyRef = useRef(false);
 
   const [mood, setMood] = useState<AppMood | null>(null);
   const [liveMood, setLiveMood] = useState<AppMood | null>(null);
@@ -155,6 +212,8 @@ export function MoodAnalyzer() {
   const [confidenceThreshold, setConfidenceThreshold] = useState(DEFAULT_CONFIDENCE_THRESHOLD);
   const [cameraState, setCameraState] = useState<'unknown' | 'granted' | 'denied' | 'blocked'>('unknown');
   const [cameraMessage, setCameraMessage] = useState('');
+  const [qualityIssues, setQualityIssues] = useState<string[]>([]);
+  const [calibrationReady, setCalibrationReady] = useState(false);
   const [webcamKey, setWebcamKey] = useState(0);
   const [panicSupportOpen, setPanicSupportOpen] = useState(false);
 
@@ -210,21 +269,41 @@ export function MoodAnalyzer() {
       const video = webcamRef.current?.video as HTMLVideoElement | undefined;
       const now = performance.now();
 
-      if (video && video.readyState === 4 && now - lastInferenceRef.current > 700) {
+      if (video && video.readyState === 4 && now - lastInferenceRef.current > INFERENCE_INTERVAL_MS) {
         lastInferenceRef.current = now;
         try {
-          const result = await faceapi
-            .detectSingleFace(
-              video,
-              new faceapi.TinyFaceDetectorOptions({
-                inputSize: 224,
-                scoreThreshold: 0.5
-              })
-            )
-            .withFaceExpressions();
+          let result: faceapi.WithFaceExpressions<
+            faceapi.WithFaceDetection<{}> | null
+          > | null = null;
+
+          for (const options of DETECTOR_OPTIONS) {
+            result = await faceapi
+              .detectSingleFace(video, options)
+              .withFaceExpressions();
+            if (result?.expressions) {
+              break;
+            }
+          }
 
           if (result?.expressions) {
+            missedFaceFramesRef.current = 0;
             setFaceVisible(true);
+            const issues = getQualityIssues(video, result.detection);
+            setQualityIssues(issues);
+            if (!issues.length) {
+              calibrationStableFramesRef.current += 1;
+              if (!calibrationReadyRef.current && calibrationStableFramesRef.current >= CALIBRATION_STABLE_FRAMES) {
+                calibrationReadyRef.current = true;
+                setCalibrationReady(true);
+                trackEvent('camera_calibration_ready');
+              }
+            } else {
+              calibrationStableFramesRef.current = 0;
+              if (calibrationReadyRef.current) {
+                calibrationReadyRef.current = false;
+                setCalibrationReady(false);
+              }
+            }
             const { mood: predictedMood, confidence } = mapExpressionsToMood(result.expressions);
 
             moodHistoryRef.current = [...moodHistoryRef.current, predictedMood].slice(-HISTORY_WINDOW);
@@ -235,7 +314,16 @@ export function MoodAnalyzer() {
               setLiveConfidence(confidence);
             }
           } else {
-            setFaceVisible(false);
+            missedFaceFramesRef.current += 1;
+            setQualityIssues(['No face detected. Align your face and keep still for a moment.']);
+            calibrationStableFramesRef.current = 0;
+            if (calibrationReadyRef.current) {
+              calibrationReadyRef.current = false;
+              setCalibrationReady(false);
+            }
+            if (missedFaceFramesRef.current >= LOST_FACE_FRAME_TOLERANCE) {
+              setFaceVisible(false);
+            }
           }
         } catch (inferenceError) {
           console.error('Realtime mood inference failed:', inferenceError);
@@ -355,6 +443,10 @@ export function MoodAnalyzer() {
                     onClick={() => {
                       setCameraState('unknown');
                       setCameraMessage('');
+                      setCalibrationReady(false);
+                      calibrationReadyRef.current = false;
+                      calibrationStableFramesRef.current = 0;
+                      setQualityIssues([]);
                       setWebcamKey((prev) => prev + 1);
                     }}
                     className="inline-flex items-center px-3 py-2 rounded-lg bg-amber-600 text-white text-sm hover:bg-amber-700"
@@ -387,6 +479,24 @@ export function MoodAnalyzer() {
           </div>
         )}
 
+        {cameraState === 'granted' && (
+          <div className="mb-3 rounded-xl border border-indigo-200 bg-indigo-50 p-4">
+            <p className="font-semibold text-indigo-800">Camera quality check</p>
+            <p className="text-sm text-indigo-700 mt-1">
+              {calibrationReady
+                ? 'Great. Face quality is stable and ready for accurate mood detection.'
+                : 'Hold still for 2-3 seconds while we calibrate lighting and framing.'}
+            </p>
+            {!!qualityIssues.length && (
+              <ul className="mt-2 text-sm text-indigo-700 list-disc list-inside space-y-1">
+                {qualityIssues.slice(0, 2).map((issue) => (
+                  <li key={issue}>{issue}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
         <Webcam
           key={webcamKey}
           ref={webcamRef}
@@ -397,27 +507,34 @@ export function MoodAnalyzer() {
           onUserMedia={() => {
             setCameraState('granted');
             setCameraMessage('');
+            setQualityIssues(['Initializing camera calibration...']);
+            trackEvent('camera_permission_granted');
           }}
           onUserMediaError={(webcamError) => {
             const context = getCameraErrorContext(webcamError);
             setCameraState(context.status);
             setCameraMessage(context.message);
             setFaceVisible(false);
+            setCalibrationReady(false);
+            calibrationReadyRef.current = false;
+            calibrationStableFramesRef.current = 0;
+            trackEvent('camera_permission_error', { reason: context.status });
           }}
           videoConstraints={{
-            width: 640,
-            height: 480,
-            facingMode: "user"
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            facingMode: { ideal: 'user' }
           }}
         />
         <div className="absolute bottom-3 left-1/2 transform -translate-x-1/2 flex items-center gap-2 sm:gap-4">
           <button
             onClick={() => {
               if (!liveMood) return;
+              trackEvent('mood_locked', { mood: liveMood, confidence: Number((liveConfidence * 100).toFixed(0)) });
               setMood(liveMood);
               setShowRecommendations(true);
             }}
-            disabled={!modelLoaded || !liveMood || !faceVisible || cameraState !== 'granted' || lowConfidence}
+            disabled={!modelLoaded || !liveMood || !faceVisible || cameraState !== 'granted' || lowConfidence || !calibrationReady}
             className="bg-purple-600 text-white px-4 sm:px-6 py-3 rounded-full shadow-lg hover:bg-purple-700 transition-colors flex items-center space-x-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {!modelLoaded ? (
@@ -450,6 +567,12 @@ export function MoodAnalyzer() {
           <div className="absolute top-3 left-3 rounded-lg bg-black/65 text-white px-3 py-2 text-xs flex items-center gap-2">
             <VideoOff className="h-4 w-4" />
             Waiting for camera permission
+          </div>
+        )}
+        {cameraState === 'granted' && !calibrationReady && (
+          <div className="absolute top-3 left-3 rounded-lg bg-indigo-700/85 text-white px-3 py-2 text-xs flex items-center gap-2">
+            <RefreshCw className="h-4 w-4 animate-spin" />
+            Calibrating camera quality...
           </div>
         )}
       </div>
@@ -553,15 +676,18 @@ function RecommendationsPage({ mood, liveMood, liveConfidence, continuousMode, c
     const result = await getMoodCoachTip(currentMood);
     setAiTip(result.text);
     setAiTipSource(result.source);
+    trackEvent('ai_tip_generated', { mood: currentMood, source: result.source });
     setAiLoading(false);
   };
 
   const handleInteraction = (tab: RecommendationTab, title: string) => {
     trackRecommendationInteraction(tab, currentMood, title);
+    trackEvent('recommendation_opened', { tab, mood: currentMood, title });
   };
 
   const handleFeedback = (tab: RecommendationTab, title: string, helpful: boolean) => {
     trackRecommendationFeedback(tab, currentMood, title, helpful);
+    trackEvent('recommendation_feedback', { tab, mood: currentMood, helpful });
     setFeedbackMessage(helpful ? 'Thanks. We will prioritize similar suggestions.' : 'Understood. We will show fewer similar suggestions.');
     window.setTimeout(() => setFeedbackMessage(''), 1500);
   };
@@ -792,218 +918,160 @@ function RecommendationFeedback({ onHelpful, onNotHelpful }: RecommendationFeedb
 }
 
 function MusicRecommendations({ mood, onInteract, onFeedback }: { mood: AppMood; onInteract: (tab: RecommendationTab, title: string) => void; onFeedback: (tab: RecommendationTab, title: string, helpful: boolean) => void }) {
-  const recommendations = {
-    happy: [
-      {
-        title: "Bollywood Party Hits",
-        description: "Upbeat Bollywood songs to keep you dancing",
-        link: "https://open.spotify.com/playlist/37i9dQZF1DX0XUfTFmNBRM",
-        platform: "Spotify"
-      },
-      {
-        title: "Punjabi Beats",
-        description: "High-energy Punjabi music",
-        link: "https://www.youtube.com/playlist?list=PLvlw_ICcAI4c7xX_Y_8RtGYr1wHgY6ZO3",
-        platform: "YouTube"
-      }
-    ],
-    sad: [
-      {
-        title: "Soulful Hindi Melodies",
-        description: "Emotional and touching Bollywood songs",
-        link: "https://open.spotify.com/playlist/37i9dQZF1DX6cg4h2PoN9y",
-        platform: "Spotify"
-      },
-      {
-        title: "Classical Indian Music",
-        description: "Calming ragas and classical pieces",
-        link: "https://www.youtube.com/playlist?list=PLvlw_ICcAI4d_f-E-YuRRvY1KpJ1EW1w1",
-        platform: "YouTube"
-      }
-    ],
-    neutral: [
-      {
-        title: "Indie India",
-        description: "Contemporary Indian indie artists",
-        link: "https://open.spotify.com/playlist/37i9dQZF1DX5q67ZpWyRrZ",
-        platform: "Spotify"
-      },
-      {
-        title: "Sufi & Folk",
-        description: "Soulful Sufi and folk music",
-        link: "https://www.youtube.com/playlist?list=PLvlw_ICcAI4f_oQPv7Y-lUJBXWXz4qgBd",
-        platform: "YouTube"
-      }
-    ],
-    excited: [
-      {
-        title: "Desi EDM Mix",
-        description: "Indian fusion with electronic beats",
-        link: "https://open.spotify.com/playlist/37i9dQZF1DX7ZUug1ANKRP",
-        platform: "Spotify"
-      },
-      {
-        title: "Bollywood Workout",
-        description: "High-energy Bollywood hits for exercise",
-        link: "https://www.youtube.com/playlist?list=PLvlw_ICcAI4e_sG8Y-4s-tXH-xXz4qgBl",
-        platform: "YouTube"
-      }
-    ],
-    tired: [
-      {
-        title: "Peaceful Sanskrit Chants",
-        description: "Calming mantras and spiritual music",
-        link: "https://open.spotify.com/playlist/37i9dQZF1DWZd79rJ6a7lp",
-        platform: "Spotify"
-      },
-      {
-        title: "Indian Instrumental",
-        description: "Soothing instrumental versions of Indian classics",
-        link: "https://www.youtube.com/playlist?list=PLvlw_ICcAI4c_f-E-YuRRvY1KpJ1EW1w1",
-        platform: "YouTube"
-      }
-    ]
-  };
+  const [items, setItems] = useState<MusicRecommendation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [source, setSource] = useState<'itunes' | 'local'>('local');
+  const [refreshKey, setRefreshKey] = useState(0);
 
-  const moodRecs = sortByPreference(recommendations[mood as keyof typeof recommendations] || [], 'music', mood);
+  useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+
+    getMusicRecommendations(mood)
+      .then((result) => {
+        if (disposed) return;
+        setItems(result.items);
+        setSource(result.source);
+      })
+      .finally(() => {
+        if (!disposed) {
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [mood, refreshKey]);
+
+  if (loading) {
+    return <RecommendationSkeleton />;
+  }
+
+  const moodRecs = sortByPreference(items, 'music', mood);
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-      {moodRecs.map((rec, index) => (
-        <a
-          key={index}
-          href={rec.link}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={() => onInteract('music', rec.title)}
-          className="block p-6 bg-gray-50 rounded-xl border border-gray-100 hover:bg-gray-100 transition-colors"
+    <div>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="text-xs text-gray-500">
+          Source: {source === 'itunes' ? 'Live iTunes trending feed' : 'Local curated fallback'}
+        </p>
+        <button
+          onClick={() => setRefreshKey((prev) => prev + 1)}
+          className="inline-flex items-center text-xs rounded-full border border-gray-300 bg-white px-3 py-1 hover:bg-gray-100"
         >
-          {index === 0 && (
-            <span className="inline-block text-[10px] font-semibold uppercase tracking-wide bg-emerald-100 text-emerald-700 border border-emerald-200 px-2 py-1 rounded-full mb-3">
-              Top Match
-            </span>
-          )}
-          <h3 className="text-xl font-semibold text-gray-800 mb-2">{rec.title}</h3>
-          <p className="text-gray-600 mb-4">{rec.description}</p>
-          <div className="flex items-center text-purple-600">
-            <span className="font-medium">Listen on {rec.platform}</span>
-            <ArrowRight className="h-4 w-4 ml-2" />
-          </div>
-          <RecommendationFeedback
-            onHelpful={() => onFeedback('music', rec.title, true)}
-            onNotHelpful={() => onFeedback('music', rec.title, false)}
-          />
-        </a>
-      ))}
+          <RefreshCw className="h-3.5 w-3.5 mr-1" />
+          Refresh Picks
+        </button>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        {moodRecs.map((rec, index) => (
+          <a
+            key={index}
+            href={rec.link}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => onInteract('music', rec.title)}
+            className="block p-6 bg-gray-50 rounded-xl border border-gray-100 hover:bg-gray-100 transition-colors"
+          >
+            {index === 0 && (
+              <span className="inline-block text-[10px] font-semibold uppercase tracking-wide bg-emerald-100 text-emerald-700 border border-emerald-200 px-2 py-1 rounded-full mb-3">
+                Top Match
+              </span>
+            )}
+            <h3 className="text-xl font-semibold text-gray-800 mb-2">{rec.title}</h3>
+            <p className="text-gray-600 mb-4">{rec.description}</p>
+            <div className="flex items-center text-purple-600">
+              <span className="font-medium">Listen on {rec.platform}</span>
+              <ArrowRight className="h-4 w-4 ml-2" />
+            </div>
+            <RecommendationFeedback
+              onHelpful={() => onFeedback('music', rec.title, true)}
+              onNotHelpful={() => onFeedback('music', rec.title, false)}
+            />
+          </a>
+        ))}
+      </div>
     </div>
   );
 }
 
 function MovieRecommendations({ mood, onInteract, onFeedback }: { mood: AppMood; onInteract: (tab: RecommendationTab, title: string) => void; onFeedback: (tab: RecommendationTab, title: string, helpful: boolean) => void }) {
-  const recommendations = {
-    happy: [
-      {
-        title: "3 Idiots",
-        genre: "Comedy, Drama",
-        description: "A heartwarming tale of friendship and following your dreams",
-        link: "https://www.netflix.com/title/70121522"
-      },
-      {
-        title: "Zindagi Na Milegi Dobara",
-        genre: "Adventure, Comedy, Drama",
-        description: "A joyful celebration of life and friendship",
-        link: "https://www.amazon.com/Zindagi-Na-Milegi-Dobara-Akhtar/dp/B07CQKX1YH"
-      }
-    ],
-    sad: [
-      {
-        title: "Taare Zameen Par",
-        genre: "Drama, Family",
-        description: "An emotional journey of a child and his teacher",
-        link: "https://www.netflix.com/title/70087087"
-      },
-      {
-        title: "Kal Ho Naa Ho",
-        genre: "Romance, Drama",
-        description: "A touching story about living life to the fullest",
-        link: "https://www.amazon.com/Kal-Ho-Naa-Shah-Khan/dp/B07C24MXPQ"
-      }
-    ],
-    neutral: [
-      {
-        title: "Lunchbox",
-        genre: "Drama, Romance",
-        description: "A heartwarming story of unexpected connection",
-        link: "https://www.amazon.com/Lunchbox-Irrfan-Khan/dp/B00JFKX5YW"
-      },
-      {
-        title: "Piku",
-        genre: "Comedy, Drama",
-        description: "A slice-of-life story about family relationships",
-        link: "https://www.netflix.com/title/80037004"
-      }
-    ],
-    excited: [
-      {
-        title: "Dhoom 3",
-        genre: "Action, Thriller",
-        description: "High-octane action and thrilling sequences",
-        link: "https://www.amazon.com/Dhoom-3-Aamir-Khan/dp/B00JZKX3CW"
-      },
-      {
-        title: "RRR",
-        genre: "Action, Drama",
-        description: "Epic action drama with stunning visuals",
-        link: "https://www.netflix.com/title/81476453"
-      }
-    ],
-    tired: [
-      {
-        title: "Barfi!",
-        genre: "Comedy, Drama, Romance",
-        description: "A heartwarming and peaceful love story",
-        link: "https://www.netflix.com/title/70242034"
-      },
-      {
-        title: "English Vinglish",
-        genre: "Drama, Family",
-        description: "A gentle and inspiring story of self-discovery",
-        link: "https://www.amazon.com/English-Vinglish-Sridevi/dp/B00GXKF8BQ"
-      }
-    ]
-  };
+  const [items, setItems] = useState<MovieRecommendation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [source, setSource] = useState<'tmdb' | 'local'>('local');
+  const [refreshKey, setRefreshKey] = useState(0);
 
-  const moodRecs = sortByPreference(recommendations[mood as keyof typeof recommendations] || [], 'movies', mood);
+  useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+
+    getMovieRecommendations(mood)
+      .then((result) => {
+        if (disposed) return;
+        setItems(result.items);
+        setSource(result.source);
+      })
+      .finally(() => {
+        if (!disposed) {
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, [mood, refreshKey]);
+
+  if (loading) {
+    return <RecommendationSkeleton />;
+  }
+
+  const moodRecs = sortByPreference(items, 'movies', mood);
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-      {moodRecs.map((movie, index) => (
-        <a
-          key={index}
-          href={movie.link}
-          target="_blank"
-          rel="noopener noreferrer"
-          onClick={() => onInteract('movies', movie.title)}
-          className="block p-6 bg-gray-50 rounded-xl border border-gray-100 hover:bg-gray-100 transition-colors"
+    <div>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <p className="text-xs text-gray-500">
+          Source: {source === 'tmdb' ? 'Live TMDB popular feed' : 'Local curated fallback'}
+        </p>
+        <button
+          onClick={() => setRefreshKey((prev) => prev + 1)}
+          className="inline-flex items-center text-xs rounded-full border border-gray-300 bg-white px-3 py-1 hover:bg-gray-100"
         >
-          {index === 0 && (
-            <span className="inline-block text-[10px] font-semibold uppercase tracking-wide bg-emerald-100 text-emerald-700 border border-emerald-200 px-2 py-1 rounded-full mb-3">
-              Top Match
-            </span>
-          )}
-          <h3 className="text-xl font-semibold text-gray-800 mb-2">{movie.title}</h3>
-          <p className="text-purple-600 text-sm mb-2">{movie.genre}</p>
-          <p className="text-gray-600 mb-4">{movie.description}</p>
-          <div className="flex items-center text-purple-600">
-            <span className="font-medium">Watch Now</span>
-            <ArrowRight className="h-4 w-4 ml-2" />
-          </div>
-          <RecommendationFeedback
-            onHelpful={() => onFeedback('movies', movie.title, true)}
-            onNotHelpful={() => onFeedback('movies', movie.title, false)}
-          />
-        </a>
-      ))}
+          <RefreshCw className="h-3.5 w-3.5 mr-1" />
+          Refresh Picks
+        </button>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        {moodRecs.map((movie, index) => (
+          <a
+            key={index}
+            href={movie.link}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() => onInteract('movies', movie.title)}
+            className="block p-6 bg-gray-50 rounded-xl border border-gray-100 hover:bg-gray-100 transition-colors"
+          >
+            {index === 0 && (
+              <span className="inline-block text-[10px] font-semibold uppercase tracking-wide bg-emerald-100 text-emerald-700 border border-emerald-200 px-2 py-1 rounded-full mb-3">
+                Top Match
+              </span>
+            )}
+            <h3 className="text-xl font-semibold text-gray-800 mb-2">{movie.title}</h3>
+            <p className="text-purple-600 text-sm mb-2">{movie.genre}</p>
+            <p className="text-gray-600 mb-4">{movie.description}</p>
+            <div className="flex items-center text-purple-600">
+              <span className="font-medium">Watch Now</span>
+              <ArrowRight className="h-4 w-4 ml-2" />
+            </div>
+            <RecommendationFeedback
+              onHelpful={() => onFeedback('movies', movie.title, true)}
+              onNotHelpful={() => onFeedback('movies', movie.title, false)}
+            />
+          </a>
+        ))}
+      </div>
     </div>
   );
 }

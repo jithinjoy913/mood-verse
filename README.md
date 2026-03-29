@@ -7,9 +7,15 @@ A modern web application that analyzes your mood using TensorFlow.js face detect
 - Real-time face detection using TensorFlow.js
 - Mood analysis and personalized recommendations
 - Continuous recommendations mode with confidence threshold controls
+- Camera calibration checks (lighting, framing, distance) before locking mood
 - Personalized ranking based on your previous recommendation clicks
 - Camera permission denied/blocked in-app recovery flow
 - Optional AI mood coach tips (free Hugging Face API with local fallback)
+- Live content recommendations:
+  - Music via free iTunes search feed (with local fallback)
+  - Movies via TMDB API (optional key, with local fallback)
+- Privacy Center (export/clear local app data)
+- Lightweight analytics tracking for UX improvement events
 - Firebase authentication
 - Interactive mood quiz
 - Responsive design with Tailwind CSS
@@ -62,6 +68,16 @@ VITE_HF_API_TOKEN=your_token_here
 ```
 
 If no token is provided, Mood Verse still works and falls back to local tip generation.
+
+## Optional Fresh Content Setup
+
+To enable live TMDB movie recommendations:
+
+```env
+VITE_TMDB_API_KEY=your_tmdb_key_here
+```
+
+Without this key, the app continues using curated local movie fallbacks.
 
 ## Deployment
 

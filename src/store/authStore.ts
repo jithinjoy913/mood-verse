@@ -11,6 +11,7 @@ import {
 import { Capacitor } from '@capacitor/core';
 import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
 import { auth, saveUserData } from '../lib/firebase'; // Ensure saveUserData is imported
+import { trackEvent } from '../services/analytics';
 
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({
@@ -28,6 +29,29 @@ interface AuthState {
   setUser: (user: User | null) => void;
 }
 
+function mapAuthError(error: unknown): string {
+  const message = (error as { message?: string })?.message ?? 'Authentication failed. Please try again.';
+  if (message.includes('auth/invalid-credential') || message.includes('auth/wrong-password')) {
+    return 'Invalid email or password. Please check your credentials and retry.';
+  }
+  if (message.includes('auth/user-not-found')) {
+    return 'No account found for this email. Please sign up first.';
+  }
+  if (message.includes('auth/popup-closed-by-user')) {
+    return 'Google sign-in was cancelled before completion.';
+  }
+  if (message.includes('auth/network-request-failed')) {
+    return 'Network issue detected. Check your internet connection and retry.';
+  }
+  if (message.includes('auth/email-already-in-use')) {
+    return 'This email is already registered. Try signing in instead.';
+  }
+  if (message.includes('SHA fingerprints')) {
+    return 'Google sign-in setup is incomplete. Add SHA-1 and SHA-256 for this Android app in Firebase.';
+  }
+  return message;
+}
+
 export const useAuthStore = create<AuthState>((set) => ({
   user: null,
   loading: false,
@@ -36,8 +60,10 @@ export const useAuthStore = create<AuthState>((set) => ({
     try {
       set({ loading: true, error: null });
       await signInWithEmailAndPassword(auth, email, password);
+      trackEvent('auth_email_signin_success');
     } catch (error) {
-      set({ error: (error as Error).message });
+      trackEvent('auth_email_signin_error', { reason: mapAuthError(error) });
+      set({ error: mapAuthError(error) });
     } finally {
       set({ loading: false });
     }
@@ -49,7 +75,7 @@ export const useAuthStore = create<AuthState>((set) => ({
 
       if (Capacitor.isNativePlatform()) {
         const nativeSignInResult = await FirebaseAuthentication.signInWithGoogle({
-          useCredentialManager: false
+          useCredentialManager: true
         });
         const idToken = nativeSignInResult.credential?.idToken;
         const accessToken = nativeSignInResult.credential?.accessToken;
@@ -74,8 +100,10 @@ export const useAuthStore = create<AuthState>((set) => ({
           email: googleUser.email ?? ''
         });
       }
+      trackEvent('auth_google_signin_success', { platform: Capacitor.getPlatform() });
     } catch (error) {
-      set({ error: (error as Error).message });
+      trackEvent('auth_google_signin_error', { reason: mapAuthError(error), platform: Capacitor.getPlatform() });
+      set({ error: mapAuthError(error) });
     } finally {
       set({ loading: false });
     }
@@ -88,9 +116,11 @@ export const useAuthStore = create<AuthState>((set) => ({
       const userId = userCredential.user.uid;
       console.log("User created with ID:", userId);
       await saveUserData(userId, { name, gender, contactNumber, email });
+      trackEvent('auth_signup_success');
     } catch (error) {
       console.error("Error during signup:", error);
-      set({ error: (error as Error).message });
+      trackEvent('auth_signup_error', { reason: mapAuthError(error) });
+      set({ error: mapAuthError(error) });
     } finally {
       set({ loading: false });
     }
@@ -102,8 +132,10 @@ export const useAuthStore = create<AuthState>((set) => ({
       if (Capacitor.isNativePlatform()) {
         await FirebaseAuthentication.signOut();
       }
+      trackEvent('auth_signout_success');
     } catch (error) {
-      set({ error: (error as Error).message });
+      trackEvent('auth_signout_error', { reason: mapAuthError(error) });
+      set({ error: mapAuthError(error) });
     } finally {
       set({ loading: false });
     }
