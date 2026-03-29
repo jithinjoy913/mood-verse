@@ -2,10 +2,10 @@ apply plugin: 'com.android.application'
 
 def keystorePath = System.getenv('MOODVERSE_KEYSTORE_PATH')
 def keystorePassword = System.getenv('MOODVERSE_KEYSTORE_PASSWORD')
-def keyAlias = System.getenv('MOODVERSE_KEY_ALIAS')
-def keyPassword = System.getenv('MOODVERSE_KEY_PASSWORD')
+def keyAliasValue = System.getenv('MOODVERSE_KEY_ALIAS')
+def keyPasswordValue = System.getenv('MOODVERSE_KEY_PASSWORD')
 
-def hasReleaseSigning = [keystorePath, keystorePassword, keyAlias, keyPassword].every {
+def hasReleaseSigning = [keystorePath, keystorePassword, keyAliasValue, keyPasswordValue].every {
     it != null && !it.trim().isEmpty()
 }
 
@@ -17,8 +17,8 @@ android {
             if (hasReleaseSigning) {
                 storeFile file(keystorePath)
                 storePassword keystorePassword
-                keyAlias keyAlias
-                keyPassword keyPassword
+                keyAlias keyAliasValue
+                keyPassword keyPasswordValue
             }
         }
     }
